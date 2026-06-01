@@ -22,7 +22,8 @@ import torch.nn.functional as F
 
 from ....configuration_utils import register_to_config
 from ....hooks._helpers import TransformerBlockMetadata
-from ....loaders.lora import LoRAModelMixin
+from ....loaders.peft import PeftAdapterMixin
+from ....loaders.weight_mapping import WeightMappingMixin
 from ....utils import apply_lora_scale, logging
 from ....utils.torch_utils import maybe_allow_in_graph
 from ..._modeling_parallel import ContextParallelInput, ContextParallelOutput
@@ -39,7 +40,6 @@ from ...modeling_outputs import Transformer2DModelOutput
 from ...modeling_utils import ModelMixin, register_metadata
 from ...normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 from ._ip_adapter import FluxIPAdapterMixin
-from ._lora import FLUX_LORA
 from ._weight_mapping import FLUX_WEIGHT_MAPPING
 
 
@@ -530,7 +530,8 @@ class FluxPosEmbed(nn.Module):
 
 class FluxTransformer2DModel(
     ModelMixin,
-    LoRAModelMixin,
+    PeftAdapterMixin,
+    WeightMappingMixin,
     AttentionMixin,
     CacheMixin,
     FluxIPAdapterMixin,
@@ -580,7 +581,6 @@ class FluxTransformer2DModel(
         "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
     }
 
-    _lora = FLUX_LORA
     _weight_mapping = FLUX_WEIGHT_MAPPING
 
     @register_to_config

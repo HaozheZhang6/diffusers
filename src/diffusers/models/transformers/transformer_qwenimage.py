@@ -868,6 +868,8 @@ class QwenImageTransformer2DModel(
                 [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
             controlnet_block_samples (*optional*):
                 ControlNet block samples to add to the transformer blocks.
+            additional_t_cond (`torch.Tensor`, *optional*):
+                Additional timestep conditioning added to the timestep embedding.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
                 tuple.
@@ -877,6 +879,7 @@ class QwenImageTransformer2DModel(
             `tuple` where the first element is the sample tensor.
         """
         hidden_states = self.img_in(hidden_states)
+
         timestep = timestep.to(hidden_states.dtype)
 
         if self.zero_cond_t:

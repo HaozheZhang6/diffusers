@@ -25,7 +25,7 @@ import shutil
 import sys
 import tempfile
 from collections import OrderedDict
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Type
@@ -40,7 +40,6 @@ from typing_extensions import Self
 
 from .. import __version__
 from ..configuration_utils import ConfigMixin
-from ..loaders.weight_mapping import WeightMappingHandler
 from ..quantizers import DiffusersAutoQuantizer, DiffusersQuantizer
 from ..quantizers.quantization_config import QuantizationMethod
 from ..utils import (
@@ -48,7 +47,6 @@ from ..utils import (
     FLASHPACK_WEIGHTS_NAME,
     FLAX_WEIGHTS_NAME,
     HF_ENABLE_PARALLEL_LOADING,
-    HUB_KWARGS,
     SAFE_WEIGHTS_INDEX_NAME,
     SAFETENSORS_WEIGHTS_NAME,
     WEIGHTS_INDEX_NAME,
@@ -245,8 +243,8 @@ class ModelMetadata:
     Constructed by :meth:`ModelMixin.metadata` — walks ``cls.__mro__`` collecting rows from each mixin's ``_metadata``
     classmethod and exposes the raw values as attributes:
 
-        >>> meta = FluxTransformer2DModel.metadata() >>> meta._supports_ip_adapter True >>> meta._lora ['bfl', 'kohya',
-        'kontext', 'xlabs'] >>> '_supports_cache' in meta True
+        >>> meta = FluxTransformer2DModel.metadata() >>> meta._supports_ip_adapter True >>> meta._weight_mapping
+        ['flux-depth', 'flux-dev', 'flux-fill', 'flux-schnell'] >>> '_supports_cache' in meta True
 
     ``repr(meta)`` (and ``print(meta)``) render a formatted table. Call :meth:`describe` to print the verbose variant
     with descriptions and docs links.
@@ -334,8 +332,8 @@ def register_metadata(metadata):
         FluxTransformerBlock(nn.Module):
             ...
 
-    Model-level capabilities are declared as plain class attributes on :class:`ModelMixin` (and on subsystem mixins
-    like :class:`LoRAModelMixin` or model-specific ones like ``FluxIPAdapterMixin``) — no decorator needed.
+    Model-level capabilities are declared as plain class attributes on :class:`ModelMixin` (and on subsystem mixins or
+    model-specific ones like ``FluxIPAdapterMixin``) — no decorator needed.
     """
 
     def wrap(cls):
@@ -372,7 +370,6 @@ class ModelMixin(torch.nn.Module, ConfigMixin, PushToHubMixin):
     _repeated_blocks: list[str] = []
     _cp_plan: dict[str, Any] | None = None
     _keys_to_ignore_on_load_unexpected: list[str] | None = None
-    _weight_mapping: WeightMappingHandler = WeightMappingHandler()
 
     def __init__(self):
         super().__init__()
@@ -431,14 +428,6 @@ class ModelMixin(torch.nn.Module, ConfigMixin, PushToHubMixin):
                 "True",
                 "Support context parallel inference.",
                 f"{DOCS_BASE}/training/distributed_inference#context-parallelism",
-            )
-        if cls._weight_mapping.supports_single_file:
-            configs = sorted(cls._weight_mapping.available_configs)
-            rows["_weight_mapping"] = (
-                configs,
-                ", ".join(configs),
-                "Auto-resolvable configs for `from_single_file(path)` (no `config=` argument required).",
-                f"{DOCS_BASE}/api/loaders/single_file",
             )
         return rows
 
@@ -1720,233 +1709,6 @@ class ModelMixin(torch.nn.Module, ConfigMixin, PushToHubMixin):
 
         if output_loading_info:
             return model, loading_info
-
-        return model
-
-    @classmethod
-    @validate_hf_hub_args
-    def from_single_file(cls, pretrained_model_link_or_path_or_dict: str | None = None, **kwargs) -> Self:
-        r"""
-        Instantiate a model from pretrained weights saved in the original `.ckpt` or `.safetensors` format. The model
-        is set in evaluation mode (`model.eval()`) by default.
-
-        Parameters:
-            pretrained_model_link_or_path_or_dict (`str`, *optional*):
-                Can be either:
-                    - A link to the `.safetensors` or `.ckpt` file (for example
-                      `"https://huggingface.co/<repo_id>/blob/main/<path_to_file>.safetensors"`) on the Hub.
-                    - A path to a local *file* containing the weights of the component model.
-                    - A state dict containing the component model weights.
-            config (`str`, *optional*):
-                - A string, the *repo id* (for example `CompVis/ldm-text2im-large-256`) of a pretrained pipeline hosted
-                  on the Hub.
-                - A path to a *directory* (for example `./my_pipeline_directory/`) containing the pipeline component
-                  configs in Diffusers format.
-            subfolder (`str`, *optional*, defaults to `""`):
-                The subfolder location of a model file within a larger model repository on the Hub or locally.
-            torch_dtype (`torch.dtype`, *optional*):
-                Override the default `torch.dtype` and load the model with another dtype.
-            force_download (`bool`, *optional*, defaults to `False`):
-                Whether or not to force the (re-)download of the model weights and configuration files, overriding the
-                cached versions if they exist.
-            cache_dir (`Union[str, os.PathLike]`, *optional*):
-                Path to a directory where a downloaded pretrained model configuration is cached if the standard cache
-                is not used.
-            proxies (`Dict[str, str]`, *optional*):
-                A dictionary of proxy servers to use by protocol or endpoint.
-            local_files_only (`bool`, *optional*, defaults to `False`):
-                Whether to only load local model weights and configuration files or not.
-            token (`str` or *bool*, *optional*):
-                The token to use as HTTP bearer authorization for remote files.
-            revision (`str`, *optional*, defaults to `"main"`):
-                The specific model version to use.
-            low_cpu_mem_usage (`bool`, *optional*):
-                Speed up model loading by only loading the pretrained weights and not initializing the weights.
-            disable_mmap (`bool`, *optional*, defaults to `False`):
-                Whether to disable mmap when loading a Safetensors model.
-
-        Returns:
-            The instantiated model.
-
-        Example:
-            ```python
-            >>> from diffusers import FluxTransformer2DModel
-
-            >>> ckpt_path = "https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/flux1-dev.safetensors"
-            >>> model = FluxTransformer2DModel.from_single_file(ckpt_path)
-            ```
-        """
-        from ..loaders.single_file_utils import (
-            SingleFileComponentError,
-            load_single_file_checkpoint,
-        )
-
-        # The ``WeightMappingHandler`` is attached as ``cls._weight_mapping`` — either overridden by the model
-        # (e.g. ``_weight_mapping = FLUX_WEIGHT_MAPPING``) or inherited as the empty default from ``ModelMixin``.
-        # Its ``supports_single_file`` property checks that the model declared a ``default_config`` so config
-        # resolution always succeeds with no extra args from the user.
-        _weight_mapping = cls._weight_mapping
-        if not _weight_mapping.supports_single_file:
-            raise ValueError(
-                f"`{cls.__name__}.from_single_file` is not supported. "
-                "The model's `WeightMappingHandler` must declare `default_config` (a key into "
-                "`available_configs`) so we can resolve which architecture to instantiate when the user "
-                "doesn't pass `config=` explicitly. Use `from_pretrained` if the model is already in "
-                "diffusers format."
-            )
-        default_subfolder = _weight_mapping.default_subfolder
-
-        pretrained_model_link_or_path = kwargs.get("pretrained_model_link_or_path", None)
-        if pretrained_model_link_or_path is not None:
-            deprecation_message = (
-                "Please use `pretrained_model_link_or_path_or_dict` argument instead for model classes"
-            )
-            deprecate("pretrained_model_link_or_path", "1.0.0", deprecation_message)
-            pretrained_model_link_or_path_or_dict = pretrained_model_link_or_path
-
-        # Hub-download kwargs (cache_dir / force_download / proxies / local_files_only / token /
-        # revision / subfolder) consolidated via the canonical ``HUB_KWARGS`` defaults.
-        hub_kwargs = {k: kwargs.pop(k, default) for k, default in HUB_KWARGS.items()}
-
-        config = kwargs.pop("config", None)
-        config_revision = kwargs.pop("config_revision", None)
-        torch_dtype = kwargs.pop("torch_dtype", None)
-        quantization_config = kwargs.pop("quantization_config", None)
-        low_cpu_mem_usage = kwargs.pop("low_cpu_mem_usage", _LOW_CPU_MEM_USAGE_DEFAULT)
-        disable_mmap = kwargs.pop("disable_mmap", False)
-        device_map = kwargs.pop("device_map", None)
-
-        user_agent = {"diffusers": __version__, "file_type": "single_file", "framework": "pytorch"}
-        if quantization_config is not None:
-            user_agent["quant"] = quantization_config.quant_method.value
-
-        if torch_dtype is not None and not isinstance(torch_dtype, torch.dtype):
-            torch_dtype = torch.float32
-            logger.warning(
-                f"Passed `torch_dtype` {torch_dtype} is not a `torch.dtype`. Defaulting to `torch.float32`."
-            )
-
-        if isinstance(pretrained_model_link_or_path_or_dict, dict):
-            state_dict = pretrained_model_link_or_path_or_dict
-        else:
-            # ``load_single_file_checkpoint`` takes everything in ``HUB_KWARGS`` except ``subfolder``.
-            state_dict = load_single_file_checkpoint(
-                pretrained_model_link_or_path_or_dict,
-                disable_mmap=disable_mmap,
-                user_agent=user_agent,
-                **{k: v for k, v in hub_kwargs.items() if k != "subfolder"},
-            )
-
-        # Normalize state_dict keys via the weight-mapping handler (strip known prefixes; no-op if none registered).
-        state_dict = _weight_mapping.normalize_state_dict_keys(state_dict)
-
-        if quantization_config is not None:
-            hf_quantizer = DiffusersAutoQuantizer.from_config(quantization_config)
-            hf_quantizer.validate_environment()
-            torch_dtype = hf_quantizer.update_torch_dtype(torch_dtype)
-        else:
-            hf_quantizer = None
-
-        if config is not None:
-            if isinstance(config, str):
-                default_pretrained_model_config_name = config
-            else:
-                raise ValueError(
-                    "Invalid `config` argument. Please provide a string representing a repo id "
-                    "or path to a local Diffusers model repo."
-                )
-        else:
-            default_pretrained_model_config_name = _weight_mapping.get_model_config(state_dict)
-            if default_subfolder is not None:
-                hub_kwargs["subfolder"] = default_subfolder
-
-        # ``load_config`` consumes the hub-download kwargs; ``config_revision`` (if set) overrides
-        # the file ``revision`` for resolving the config repo specifically.
-        diffusers_model_config = cls.load_config(
-            pretrained_model_name_or_path=default_pretrained_model_config_name,
-            **{**hub_kwargs, "revision": config_revision},
-        )
-        expected_kwargs, optional_kwargs = cls._get_signature_keys(cls)
-        model_kwargs = {k: kwargs.get(k) for k in kwargs if k in expected_kwargs or k in optional_kwargs}
-        diffusers_model_config.update(model_kwargs)
-
-        if is_accelerate_available():
-            from accelerate import init_empty_weights
-
-            ctx = init_empty_weights if low_cpu_mem_usage else nullcontext
-        else:
-            ctx = nullcontext
-
-        with ctx():
-            model = cls.from_config(diffusers_model_config)
-
-        use_keep_in_fp32_modules = (cls._keep_in_fp32_modules is not None) and (
-            (torch_dtype == torch.float16) or hasattr(hf_quantizer, "use_keep_in_fp32_modules")
-        )
-        if use_keep_in_fp32_modules:
-            keep_in_fp32_modules = cls._keep_in_fp32_modules
-            if not isinstance(keep_in_fp32_modules, list):
-                keep_in_fp32_modules = [keep_in_fp32_modules]
-        else:
-            keep_in_fp32_modules = []
-
-        # ``normalize_state_dict_keys`` already ran earlier (before model creation) for detection; this call is
-        # idempotent and runs the full converter only if keys still don't match the freshly-built model.
-        state_dict = _weight_mapping.maybe_convert_state_dict(model, state_dict)
-
-        if not state_dict:
-            raise SingleFileComponentError(
-                f"Failed to load {cls.__name__}. Weights for this component appear to be missing in the checkpoint."
-            )
-
-        loaded_keys = list(state_dict.keys())
-
-        if hf_quantizer is not None:
-            hf_quantizer.preprocess_model(
-                model=model, device_map=device_map, keep_in_fp32_modules=keep_in_fp32_modules
-            )
-
-        device_map = _determine_device_map(model, device_map, None, torch_dtype, keep_in_fp32_modules, hf_quantizer)
-        if hf_quantizer is not None:
-            hf_quantizer.validate_environment(device_map=device_map)
-
-        (
-            model,
-            missing_keys,
-            unexpected_keys,
-            mismatched_keys,
-            offload_index,
-            error_msgs,
-        ) = cls._load_pretrained_model(
-            model,
-            state_dict,
-            None,
-            None,
-            loaded_keys,
-            low_cpu_mem_usage=low_cpu_mem_usage,
-            device_map=device_map,
-            dtype=torch_dtype,
-            hf_quantizer=hf_quantizer,
-            keep_in_fp32_modules=keep_in_fp32_modules,
-        )
-
-        if device_map is not None:
-            from accelerate import dispatch_model
-
-            device_map_kwargs = {
-                "device_map": device_map,
-                "offload_index": offload_index,
-            }
-            dispatch_model(model, **device_map_kwargs)
-
-        if hf_quantizer is not None:
-            hf_quantizer.postprocess_model(model)
-            model.hf_quantizer = hf_quantizer
-
-        if torch_dtype is not None and hf_quantizer is None:
-            model.to(torch_dtype)
-
-        model.eval()
 
         return model
 
