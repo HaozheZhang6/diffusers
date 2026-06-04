@@ -11,7 +11,6 @@
 > Ideogram 4 is a flow-matching text-to-image model with a few characteristics that are relevant for training:
 > - It uses **two** transformers — a text-conditional `transformer` and an `unconditional_transformer` blended at inference via asymmetric classifier-free guidance. This trainer adds LoRA to the **conditional `transformer` only**; the unconditional one stays frozen.
 > - Text conditioning comes from a **Qwen3-VL** multimodal text encoder (a fixed set of decoder layers is concatenated into the per-token features).
-> - The VAE is `AutoencoderKLFlux2`; latents are patchified 2×2 and batch-norm normalized before being fed to the transformer.
 
 ## Running locally with PyTorch
 
