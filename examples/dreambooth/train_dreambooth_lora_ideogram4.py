@@ -209,7 +209,11 @@ def log_validation(
 
     # run inference
     generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed is not None else None
-    autocast_ctx = torch.autocast(accelerator.device.type) if not is_final_validation else nullcontext()
+    # Use the model's dtype (e.g. bf16); torch.autocast defaults to fp16 on CUDA, which overflows the
+    # bf16/nf4 transformer activations and produces NaN validation images.
+    autocast_ctx = (
+        torch.autocast(accelerator.device.type, dtype=torch_dtype) if not is_final_validation else nullcontext()
+    )
 
     images = []
     for _ in range(args.num_validation_images):
