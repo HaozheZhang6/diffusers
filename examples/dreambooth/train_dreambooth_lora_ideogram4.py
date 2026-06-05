@@ -209,11 +209,39 @@ def log_validation(
 
     # run inference
     generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed is not None else None
-    # Use the model's dtype (e.g. bf16); torch.autocast defaults to fp16 on CUDA, which overflows the
-    # bf16/nf4 transformer activations and produces NaN validation images.
-    autocast_ctx = (
-        torch.autocast(accelerator.device.type, dtype=torch_dtype) if not is_final_validation else nullcontext()
-    )
+    # No autocast: the pipeline already runs natively in the right dtype (e.g. bf16), and wrapping it in
+    # torch.autocast corrupts the outputs (fp16 -> NaN images, bf16 -> gray/noisy images). Verified
+    # empirically on the nf4 checkpoint: identical generations are clean without autocast and garbage
+    # under autocast of either dtype.
+    autocast_ctx = nullcontext()
+
+    # Intermediate validation runs the LIVE training transformer, which can carry float32 params that
+    # other trainers paper over with autocast (unusable here, see above):
+    # - trainable LoRA params (peft creates fp32 adapters on quantized base layers), and
+    # - biases of quantized Linear4bit modules that received fp32 activations during training
+    #   (bitsandbytes mutates `bias.data` to the input dtype in its forward).
+    # Any fp32 param also makes the model's `.dtype` property report fp32, steering the pipeline's
+    # internal casts to fp32 and crashing attention with mixed dtypes. So cast every fp32 param to the
+    # inference dtype for generation, and restore the trainable (LoRA) ones to fp32 afterwards — the
+    # Parameter objects are preserved, so optimizer state and references are unaffected. The bnb biases
+    # were loaded in the inference dtype to begin with, so they need no restore.
+    restore_fp32 = False
+    if not is_final_validation and torch_dtype != torch.float32:
+        for param in pipeline.transformer.parameters():
+            if param.dtype == torch.float32:
+                param.data = param.data.to(torch_dtype)
+                restore_fp32 = restore_fp32 or param.requires_grad
+
+    # accelerate's mixed-precision wrapper makes the live transformer's forward run under
+    # torch.autocast, which corrupts Ideogram4 generations just like an explicit autocast (see
+    # above). Strip the wrapper for validation and restore it afterwards so training still runs
+    # under the accelerate-managed autocast.
+    saved_wrapped_forward = None
+    transformer_module = pipeline.transformer
+    if not is_final_validation and "_original_forward" in transformer_module.__dict__:
+        saved_wrapped_forward = transformer_module.__dict__["forward"]
+        saved_original_forward = transformer_module.__dict__["_original_forward"]
+        accelerator.unwrap_model(transformer_module, keep_fp32_wrapper=False)
 
     images = []
     for _ in range(args.num_validation_images):
@@ -239,6 +267,13 @@ def log_validation(
                     ]
                 }
             )
+
+    if saved_wrapped_forward is not None:
+        transformer_module.forward = saved_wrapped_forward
+        transformer_module._original_forward = saved_original_forward
+
+    if restore_fp32:
+        cast_training_params(pipeline.transformer, dtype=torch.float32)
 
     del pipeline
     free_memory()
@@ -1595,8 +1630,9 @@ def main(args):
 
         # Patch: inverse of z.view(batch, ae_ch, grid_h*patch, grid_w*patch)
         z = z.view(batch_size, ae_channels, grid_h, patch, grid_w, patch)
-        # Inverse of z.permute(0, 5, 1, 3, 2, 4)
-        z = z.permute(0, 2, 4, 1, 3, 5).contiguous()
+        # Inverse of the pipeline decode's permute(0, 5, 1, 3, 2, 4): the packed channel layout is
+        # (p_h, p_w, ae) — ae varies fastest — so ae must be the LAST dim before flattening.
+        z = z.permute(0, 2, 4, 3, 5, 1).contiguous()
         # Pack channels and flatten the grid to a token sequence: (B, grid_h*grid_w, patch*patch*ae)
         z = z.view(batch_size, grid_h * grid_w, patch * patch * ae_channels)
 
