@@ -1712,6 +1712,24 @@ def main(args):
         vae = vae.to("cpu")
         del vae
 
+    # With --upsample_prompt the LoRA only ever sees long structured (JSON) captions, so a plain
+    # validation prompt is out-of-distribution for it and degrades misleadingly as training
+    # progresses. Upsample the validation prompt once here (while the enhancer is still loaded) so
+    # validation matches the training conditioning distribution.
+    if args.upsample_prompt and args.validation_prompt is not None:
+        with offload_models(
+            text_encoding_pipeline.prompt_enhancer_head,
+            device=text_encoding_pipeline.text_encoder.device,
+            offload=True,
+        ):
+            upsampled = text_encoding_pipeline.upsample_prompt(
+                args.validation_prompt, height=args.resolution, width=args.resolution
+            )
+            # upsample_prompt returns a list for a single string input; keep validation_prompt a
+            # str so downstream (tracker hparams, encode_prompt) handles it as a single prompt.
+            args.validation_prompt = upsampled[0] if isinstance(upsampled, list) else upsampled
+        logger.info(f"Upsampled validation prompt: {args.validation_prompt}")
+
     # move back to cpu before deleting to ensure memory is freed see: https://github.com/huggingface/diffusers/issues/11376#issue-3008144624
     text_encoding_pipeline = text_encoding_pipeline.to("cpu")
     del text_encoder, tokenizer
